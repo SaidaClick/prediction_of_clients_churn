@@ -1,0 +1,119 @@
+{
+  "dataset": {
+    "as_of": "2026-01-15",
+    "before": "2026-01-31",
+    "horizon_days": 16,
+    "splits": {
+      "train": {
+        "rows": 23119,
+        "positive": 1520
+      },
+      "validation": {
+        "rows": 7707,
+        "positive": 507
+      },
+      "test": {
+        "rows": 7707,
+        "positive": 506
+      }
+    },
+    "features": [
+      "total_calls",
+      "total_duration",
+      "avg_duration",
+      "total_bytes",
+      "avg_bytes",
+      "total_charge",
+      "avg_charge",
+      "roaming_share",
+      "unique_nodes",
+      "unique_regions",
+      "active_days",
+      "days_since_last_call",
+      "calls_per_day",
+      "ticket_count",
+      "avg_load",
+      "avg_error_rate",
+      "avg_latency",
+      "avg_temperature"
+    ]
+  },
+  "models": {
+    "logistic_regression": {
+      "threshold": 0.5508826583969881,
+      "validation": {
+        "roc_auc": 0.6117559719482797,
+        "average_precision": 0.11349931038687619,
+        "precision": 0.11401425178147269,
+        "recall": 0.378698224852071,
+        "f1": 0.17526243724326793,
+        "tp": 192,
+        "fp": 1492,
+        "fn": 315,
+        "tn": 5708
+      },
+      "test": {
+        "default": {
+          "roc_auc": 0.6296795076221847,
+          "average_precision": 0.13490352857139837,
+          "precision": 0.09285479091208429,
+          "recall": 0.5573122529644269,
+          "f1": 0.15918712955122777,
+          "tp": 282,
+          "fp": 2755,
+          "fn": 224,
+          "tn": 4446
+        },
+        "selected": {
+          "roc_auc": 0.6296795076221847,
+          "average_precision": 0.13490352857139837,
+          "precision": 0.11538461538461539,
+          "recall": 0.391304347826087,
+          "f1": 0.1782178217821782,
+          "tp": 198,
+          "fp": 1518,
+          "fn": 308,
+          "tn": 5683
+        }
+      }
+    },
+    "xgboost": {
+      "threshold": 0.3395473062992096,
+      "validation": {
+        "roc_auc": 0.606526134122288,
+        "average_precision": 0.10741311430536932,
+        "precision": 0.09843020789138736,
+        "recall": 0.45759368836291914,
+        "f1": 0.16201117318435754,
+        "tp": 232,
+        "fp": 2125,
+        "fn": 275,
+        "tn": 5075
+      },
+      "test": {
+        "default": {
+          "roc_auc": 0.6079985597081653,
+          "average_precision": 0.11202221379102237,
+          "precision": 0.11693548387096774,
+          "recall": 0.22924901185770752,
+          "f1": 0.1548731642189586,
+          "tp": 116,
+          "fp": 876,
+          "fn": 390,
+          "tn": 6325
+        },
+        "selected": {
+          "roc_auc": 0.6079985597081653,
+          "average_precision": 0.11202221379102237,
+          "precision": 0.09072741806554756,
+          "recall": 0.44861660079051385,
+          "f1": 0.15093085106382978,
+          "tp": 227,
+          "fp": 2275,
+          "fn": 279,
+          "tn": 4926
+        }
+      }
+    }
+  }
+}

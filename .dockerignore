@@ -1,7 +1,0 @@
-*
-!Dockerfile
-!requirements.txt
-!pipeline.py
-!config.json
-!data/
-!data/telemetry-xs.tar.gz

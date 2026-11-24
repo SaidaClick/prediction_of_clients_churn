@@ -8,6 +8,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN uv venv /opt/venv && uv pip sync --python /opt/venv/bin/python requirements.txt
 COPY pipeline.py config.json ./
-COPY data/telemetry-xs.tar.gz data/
+COPY data/churn-xs.tar.gz data/
 
 ENTRYPOINT ["/opt/venv/bin/python", "pipeline.py"]

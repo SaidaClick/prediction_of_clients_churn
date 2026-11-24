@@ -4,7 +4,6 @@ import hashlib
 import io
 import json
 import logging
-import math
 import platform
 import tarfile
 from pathlib import Path, PurePosixPath
@@ -18,117 +17,216 @@ from sklearn.metrics import (
     average_precision_score,
     confusion_matrix,
     f1_score,
+    precision_recall_curve,
     precision_score,
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.model_selection import train_test_split
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 
 ROOT = Path(__file__).resolve().parent
 LOG = logging.getLogger(__name__)
-FAILURE = "is_failure"
-LEVELS = {"info", "warn", "error"}
+KEY = "subscriber_key"
+TARGET = "churned"
+SOURCES = {
+    "cdr": ("cdr.csv", [
+        "record_id", "event_ts", "ingest_ts", KEY, "duration_sec", "bytes_down",
+        "charge", "node_id", "region_id", "roaming_flag",
+    ]),
+    "tickets": ("tickets.csv", ["ticket_id", "created_ts", KEY]),
+    "telemetry": ("telemetry.jsonl", [
+        "ts", "node_id", "load_pct", "error_rate", "latency_ms", "temperature_c",
+    ]),
+}
 METRICS = ("roc_auc", "average_precision", "precision", "recall", "f1", "tp", "fp", "fn", "tn")
 
 
-def load_data(source, features):
-    """Read daily JSONL partitions directly from the source archive."""
-    required = {"ts", "node_id", "level"} | (set(features) - {"hour"})
-    frames = []
-    with tarfile.open(source, "r:gz") as archive:
-        partitions = sorted(
-            (
-                member for member in archive.getmembers()
-                if member.isfile()
-                and PurePosixPath(member.name).match("raw/telemetry/dt=*/telemetry.jsonl")
-            ),
-            key=lambda member: member.name,
-        )
-        if not partitions:
-            raise ValueError("No raw/telemetry/dt=*/telemetry.jsonl partitions found")
-        if len({member.name for member in partitions}) != len(partitions):
-            raise ValueError("Duplicate partition paths in the input archive")
-        for member in partitions:
-            with archive.extractfile(member) as partition:
-                batch = pd.read_json(
-                    io.BytesIO(partition.read()), lines=True,
-                    dtype={"node_id": "string"}, convert_dates=False,
-                )
-            missing = required - set(batch.columns)
-            if batch.empty or missing:
-                raise ValueError(f"Invalid partition {member.name}. Missing columns: {sorted(missing)}")
-            frames.append(batch)
-    data = pd.concat(frames, ignore_index=True)
-    LOG.info("Loaded %d records from %d daily partitions", len(data), len(partitions))
+def load_data(source, cutoff, ignored_partitions):
+    """Read source partitions available at the prediction cutoff."""
+    partitions = {kind: {} for kind in SOURCES}
+    truth = None
+    passport = None
+    with tarfile.open(source, "r|gz") as archive:
+        for member in archive:
+            if not member.isfile():
+                continue
+            path = PurePosixPath(member.name)
+            if path.as_posix() == "reference/passport.json":
+                passport = json.loads(archive.extractfile(member).read())
+                continue
+            if path.as_posix() == "reference/churn_truth.csv":
+                truth = pd.read_csv(io.BytesIO(archive.extractfile(member).read()), usecols=[KEY, "churn_day_index"])
+                continue
+            # The late layer has no consistent ingestion timestamp across all tables.
+            if len(path.parts) != 4 or path.parts[0] != "raw" or path.parts[1] not in SOURCES:
+                continue
+            _, kind, partition, name = path.parts
+            filename, columns = SOURCES[kind]
+            if name != filename or not partition.startswith("dt="):
+                continue
+            if pd.Timestamp(partition[3:]) >= cutoff:
+                continue
+            if member.name in ignored_partitions:
+                LOG.warning("Skipping configured damaged partition %s", member.name)
+                continue
+            if member.name in partitions[kind]:
+                raise ValueError(f"Duplicate partition {member.name}")
+            with archive.extractfile(member) as stream:
+                if filename.endswith(".csv"):
+                    frame = pd.read_csv(io.BytesIO(stream.read()), usecols=columns)
+                else:
+                    frame = pd.read_json(io.BytesIO(stream.read()), lines=True, convert_dates=False)
+                    frame = frame[columns]
+            partitions[kind][member.name] = frame
+
+    tables = {}
+    for kind, frames in partitions.items():
+        if not frames:
+            raise ValueError(f"No {kind} partitions before {cutoff.date()}")
+        tables[kind] = pd.concat([frames[name] for name in sorted(frames)], ignore_index=True)
+        LOG.info("Loaded %d %s rows from %d partitions", len(tables[kind]), kind, len(frames))
+    if passport is None or truth is None:
+        raise ValueError("The input archive must contain the source passport and churn labels")
+    return tables, truth, passport
+
+
+def parse_timestamps(values):
+    values = values.astype("string").str.strip()
+    iso = pd.to_datetime(values, format="ISO8601", errors="coerce")
+    local = pd.to_datetime(values, format="%d.%m.%Y %H:%M:%S", errors="coerce")
+    return iso.fillna(local)
+
+
+def preprocess(tables, truth, passport, config):
+    """Build one point-in-time row per subscriber still active at the cutoff."""
+    cutoff = pd.Timestamp(config["as_of"])
+    label_start = pd.Timestamp(passport["period_start"])
+    label_days = int(passport["period_days"])
+    horizon = config["horizon_days"]
+    label_end = label_start + pd.Timedelta(days=label_days)
+    horizon_end = cutoff + pd.Timedelta(days=horizon)
+    if horizon <= 0 or not label_start < cutoff < horizon_end <= label_end:
+        raise ValueError("Prediction window must fit inside the source label coverage")
+
+    day_index = pd.to_numeric(truth["churn_day_index"], errors="raise")
+    if (truth[KEY].isna().any() or truth[KEY].duplicated().any()
+            or not day_index.isin(range(-1, label_days)).all()):
+        raise ValueError("Invalid subscriber IDs or churn dates in the label table")
+    churn_dates = label_start + pd.to_timedelta(day_index, unit="D")
+    eligible = day_index.eq(-1) | churn_dates.ge(cutoff)
+    labels = truth.loc[eligible, [KEY]].copy()
+    labels[TARGET] = (day_index.ge(0) & churn_dates.lt(horizon_end)).loc[eligible].astype("int8")
+
+    cdr = tables["cdr"].copy()
+    cdr["event_ts"] = parse_timestamps(cdr["event_ts"])
+    cdr["ingest_ts"] = parse_timestamps(cdr["ingest_ts"])
+    cdr = cdr.loc[cdr["event_ts"].lt(cutoff) & cdr["ingest_ts"].lt(cutoff)]
+    cdr = cdr.dropna(subset=[KEY, "record_id"]).drop_duplicates("record_id", keep="last").copy()
+    cdr["duration_sec"] = pd.to_numeric(cdr["duration_sec"], errors="coerce").clip(lower=0)
+    cdr["bytes_down"] = pd.to_numeric(cdr["bytes_down"], errors="coerce").clip(lower=0)
+    cdr["charge"] = pd.to_numeric(cdr["charge"], errors="coerce")
+    cdr["roaming_flag"] = (
+        cdr["roaming_flag"].astype("string").str.strip().str.lower().isin({"1", "1.0", "true", "yes"})
+    )
+    cdr["active_day"] = cdr["event_ts"].dt.normalize()
+    records = cdr.groupby(KEY).agg(
+        total_calls=("record_id", "size"),
+        total_duration=("duration_sec", "sum"),
+        avg_duration=("duration_sec", "mean"),
+        total_bytes=("bytes_down", "sum"),
+        avg_bytes=("bytes_down", "mean"),
+        total_charge=("charge", "sum"),
+        avg_charge=("charge", "mean"),
+        roaming_share=("roaming_flag", "mean"),
+        unique_nodes=("node_id", "nunique"),
+        unique_regions=("region_id", "nunique"),
+        active_days=("active_day", "nunique"),
+        last_call=("event_ts", "max"),
+    )
+    records["days_since_last_call"] = (cutoff - records.pop("last_call")).dt.total_seconds() / 86400
+    records["calls_per_day"] = records["total_calls"] / records["active_days"]
+    for column in ("total_bytes", "avg_bytes"):
+        records[column] = np.log1p(records[column])
+
+    tickets = tables["tickets"]
+    tickets = tickets.loc[parse_timestamps(tickets["created_ts"]).lt(cutoff)]
+    tickets = tickets.dropna(subset=[KEY, "ticket_id"]).drop_duplicates("ticket_id", keep="last")
+    ticket_count = tickets.groupby(KEY)["ticket_id"].size().rename("ticket_count")
+
+    telemetry = tables["telemetry"]
+    telemetry = telemetry.loc[parse_timestamps(telemetry["ts"]).lt(cutoff)].drop_duplicates()
+    node_stats = telemetry.groupby("node_id").agg(
+        avg_load=("load_pct", "mean"),
+        avg_error_rate=("error_rate", "mean"),
+        avg_latency=("latency_ms", "mean"),
+        avg_temperature=("temperature_c", "mean"),
+    )
+    main_node = (
+        cdr.groupby([KEY, "node_id"]).size().sort_values(ascending=False, kind="stable")
+        .rename("count").reset_index().drop_duplicates(KEY).set_index(KEY)
+    )
+    subscriber_network = main_node.join(node_stats, on="node_id")[list(node_stats.columns)]
+    features = records.join(ticket_count).join(subscriber_network).fillna(0)
+    data = features.join(labels.set_index(KEY), how="inner", validate="one_to_one").reset_index()
+    if not np.isfinite(data.drop(columns=[KEY, TARGET]).to_numpy(dtype=float)).all():
+        raise ValueError("Aggregated features contain non-finite values")
+    if data[TARGET].nunique() != 2:
+        raise ValueError("The selected cohort must contain both outcomes")
+
+    test_fraction = config["test_fraction"]
+    validation_fraction = config["validation_fraction"]
+    train, holdout = train_test_split(
+        data.index, test_size=test_fraction + validation_fraction,
+        stratify=data[TARGET], random_state=config["seed"],
+    )
+    validation, test = train_test_split(
+        holdout, test_size=test_fraction / (test_fraction + validation_fraction),
+        stratify=data.loc[holdout, TARGET], random_state=config["seed"],
+    )
+    data["split"] = ""
+    for split, rows in (("train", train), ("validation", validation), ("test", test)):
+        data.loc[rows, "split"] = split
+        if data.loc[rows, TARGET].nunique() != 2:
+            raise ValueError(f"Both outcomes must be represented in {split}")
+    if data[KEY].duplicated().any() or data["split"].eq("").any():
+        raise RuntimeError("Invalid subscriber split assignment")
+    LOG.info("Prepared %d subscribers, %d future churn events", len(data), data[TARGET].sum())
+    LOG.info("Split sizes: %s", data["split"].value_counts().to_dict())
     return data
 
 
-def preprocess(data, config):
-    """Validate records, prepare features and assign each node to one split."""
-    features = config["features"]
-    clean = data.drop_duplicates().reset_index(drop=True)
-    clean["ts"] = pd.to_datetime(clean["ts"], format="ISO8601", utc=True)
-    clean["node_id"] = clean["node_id"].str.strip()
-    clean["level"] = clean["level"].astype("string").str.strip().str.lower()
-    if clean["ts"].isna().any() or clean["node_id"].fillna("").eq("").any():
-        raise ValueError("Missing timestamp or node ID")
-    if not clean["level"].isin(LEVELS).all():
-        raise ValueError("Unexpected telemetry level")
-    clean["hour"] = clean["ts"].dt.hour
-    for feature in features:
-        clean[feature] = pd.to_numeric(clean[feature], errors="coerce")
-    if not np.isfinite(clean[features].to_numpy(dtype=float)).all():
-        raise ValueError("Features contain missing or non-finite numeric values")
-    clean[FAILURE] = clean["level"].eq("error").astype("int8")
-
-    x, y, groups = clean[features], clean[FAILURE], clean["node_id"]
-    holdout = StratifiedGroupKFold(config["test_folds"], shuffle=True, random_state=config["seed"])
-    validation = StratifiedGroupKFold(
-        config["validation_folds"], shuffle=True, random_state=config["seed"]
-    )
-    rest, test = next(holdout.split(x, y, groups))
-    train, val = next(validation.split(x.iloc[rest], y.iloc[rest], groups.iloc[rest]))
-    clean["split"] = ""
-    for split, rows in {"train": rest[train], "validation": rest[val], "test": test}.items():
-        clean.loc[rows, "split"] = split
-        if clean.loc[rows, FAILURE].nunique() != 2:
-            raise ValueError(f"Both classes must be represented in {split}")
-    if (clean["split"].eq("").any()
-            or clean.groupby("node_id")["split"].nunique().ne(1).any()):
-        raise RuntimeError("Invalid split assignment")
-
-    LOG.info("Prepared %d records, removed %d duplicates, found %d failures",
-             len(clean), len(data) - len(clean), clean[FAILURE].sum())
-    LOG.info("Split sizes: %s", clean["split"].value_counts().to_dict())
-    return clean
-
-
-def train_model(train, config):
-    """Fit both models using only the training split."""
+def train_model(train, features, config):
+    """Fit the baseline and boosted models on the training subscribers."""
+    positive = int(train[TARGET].sum())
     models = {
         "logistic_regression": make_pipeline(
             StandardScaler(),
             LogisticRegression(random_state=config["seed"], **config["logistic_regression"]),
         ),
-        "xgboost": XGBClassifier(random_state=config["seed"], **config["xgboost"]),
+        "xgboost": XGBClassifier(
+            random_state=config["seed"], scale_pos_weight=(len(train) - positive) / positive,
+            **config["xgboost"],
+        ),
     }
     for name, model in models.items():
-        LOG.info("Training %s on %d records", name, len(train))
-        model.fit(train[config["features"]], train[FAILURE])
+        LOG.info("Training %s on %d subscribers", name, len(train))
+        model.fit(train[features], train[TARGET])
     return models
 
 
 def evaluate(y_true, scores, threshold):
-    """Compute ranking and classification metrics on the held-out labels."""
+    """Check probabilities and compute metrics for a single split."""
     if (scores.shape != (len(y_true),) or not np.isfinite(scores).all()
             or not ((scores >= 0) & (scores <= 1)).all()):
         raise RuntimeError("Invalid model probabilities")
     predicted = scores >= threshold
     tn, fp, fn, tp = confusion_matrix(y_true, predicted, labels=[0, 1]).ravel()
-    metrics = {
+    if int(tn + fp + fn + tp) != len(y_true):
+        raise RuntimeError("The confusion matrix does not cover all subscribers")
+    return {
         "roc_auc": float(roc_auc_score(y_true, scores)),
         "average_precision": float(average_precision_score(y_true, scores)),
         "precision": float(precision_score(y_true, predicted, zero_division=0)),
@@ -136,96 +234,70 @@ def evaluate(y_true, scores, threshold):
         "f1": float(f1_score(y_true, predicted, zero_division=0)),
         "tp": int(tp), "fp": int(fp), "fn": int(fn), "tn": int(tn),
     }
-    if tp + tn + fp + fn != len(y_true) or not all(
-        math.isfinite(metrics[key]) and 0 <= metrics[key] <= 1 for key in METRICS[:5]
-    ):
-        raise RuntimeError("Invalid evaluation metrics")
-    return metrics
 
 
-def select_threshold(y_true, scores, config):
-    costs = []
-    for threshold in config["thresholds"]:
-        tn, fp, fn, tp = confusion_matrix(y_true, scores >= threshold, labels=[0, 1]).ravel()
-        cost = int(fp) * config["false_positive_cost"] + int(fn) * config["false_negative_cost"]
-        costs.append((cost, -threshold))
-    cost, negative_threshold = min(costs)
-    return -negative_threshold, cost
+def select_threshold(y_true, scores):
+    precision, recall, candidates = precision_recall_curve(y_true, scores)
+    f1 = 2 * precision[:-1] * recall[:-1] / (precision[:-1] + recall[:-1] + 1e-12)
+    return float(candidates[np.argmax(f1)])
 
 
-def write_report(destination, data, raw_rows, results):
-    overview = (
-        data.groupby("split", sort=False)
-        .agg(rows=(FAILURE, "size"), nodes=("node_id", "nunique"), errors=(FAILURE, "sum"))
-    )
-    daily = (
-        data.groupby(data["ts"].dt.strftime("%Y-%m-%d"))
-        .agg(rows=(FAILURE, "size"), errors=(FAILURE, "sum"))
-    )
+def write_report(destination, data, overview, results):
     text = [
-        "# Обнаружение сбоев по сетевой телеметрии",
+        "# Прогнозирование оттока абонентов",
         "",
-        "Целевой класс соответствует записи с уровнем `error`. "
-        "Уровень и текст сообщения исключены из признаков.",
+        f"Дата прогноза: {overview['as_of']}. Окно оттока: {overview['horizon_days']} дней "
+        f"до {overview['before']} (исключая эту дату).",
         "",
-        "## Обзор данных",
+        f"Абонентов: {len(data):,}. Отток в окне: {data[TARGET].sum():,} ({data[TARGET].mean():.2%}). "
+        "В выборку вошли абоненты с CDR до среза, которые на дату среза ещё не ушли.",
         "",
-        f"Исходных записей: {raw_rows:,}. Удалено дубликатов: {raw_rows - len(data):,}. "
-        f"Осталось {len(data):,} записей и {data['node_id'].nunique():,} узлов. "
-        f"Сбоев: {data[FAILURE].sum():,} ({data[FAILURE].mean():.3%}).",
-        "",
-        "| Выборка | Записи | Узлы | Сбои | Доля сбоев |",
-        "|---|---:|---:|---:|---:|",
+        "| Выборка | Абоненты | Ушли | Доля оттока |",
+        "|---|---:|---:|---:|",
     ]
-    for split in ("train", "validation", "test"):
-        row = overview.loc[split]
-        text.append(f"| {split} | {row.rows} | {row.nodes} | {row.errors} | {row.errors / row.rows:.3%} |")
+    for split, summary in overview["splits"].items():
+        text.append(f"| {split} | {summary['rows']} | {summary['positive']} | "
+                    f"{summary['positive'] / summary['rows']:.2%} |")
     text += [
         "",
-        f"Дней с телеметрией: {len(daily)}. Дней, когда были сбои: {daily.errors.gt(0).sum()}.",
+        "## Обзор признаков",
         "",
-        "| Дата (UTC) | Записи | Сбои |",
+        "| Признак | Медиана у оставшихся | Медиана у ушедших |",
         "|---|---:|---:|",
     ]
-    text.extend(f"| {day} | {row.rows} | {row.errors} |" for day, row in daily.iterrows())
+    medians = data.groupby(TARGET)[
+        ["total_calls", "active_days", "days_since_last_call", "ticket_count", "avg_error_rate"]
+    ].median()
+    for feature in medians.columns:
+        text.append(f"| `{feature}` | {medians.at[0, feature]:.4g} | {medians.at[1, feature]:.4g} |")
     text += [
         "",
-        "## Оценка на тестовых узлах",
+        "## Качество на тестовой выборке",
         "",
-        "PR-AUC здесь представлена как average precision. Порог для каждой модели "
-        "подобран на валидационных узлах по стоимости ошибок. Для сравнения указан и порог 0.5.",
+        "Рабочий порог для каждой модели максимизирует F1 на валидационной выборке. "
+        "AP — average precision. Для такого же теста базовый уровень AP равен доле оттока.",
         "",
         "| Модель | Режим | Порог | ROC-AUC | AP | Precision | Recall | F1 | TP | FP | FN | TN |",
         "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for name, result in results.items():
-        for mode, threshold in (("default", 0.5), ("selected", result["threshold"])):
-            metrics = result["test"][mode]
+        for mode, threshold in (("0.5", 0.5), ("По валидации", result["threshold"])):
+            metrics = result["test"]["default" if mode == "0.5" else "selected"]
             values = [f"{metrics[key]:.4f}" for key in METRICS[:5]]
             values.extend(str(metrics[key]) for key in METRICS[5:])
-            text.append(f"| {name} | {mode} | {threshold:g} | " + " | ".join(values) + " |")
+            text.append(f"| {name} | {mode} | {threshold:.4f} | " + " | ".join(values) + " |")
     text += [
         "",
         "## Ограничения",
         "",
-        "Признаки описывают состояние узла в момент записи. "
-        "Эксперимент измеряет качество обнаружения уже наблюдаемого события. "
-        "Разбиение по узлам проверяет перенос на другие узлы из того же периода. "
-        "Для оценки переноса на будущие периоды нужны данные о независимых инцидентах.",
+        "Данные синтетические и охватывают один месяц. Разбиение по абонентам оценивает "
+        "качество на других абонентах того же среза. Для оценки устойчивости во времени "
+        "нужны дополнительные срезы и данные за последующие месяцы.",
     ]
     destination.write_text("\n".join(text) + "\n", encoding="utf-8")
 
 
 def run_pipeline(config, source, output):
-    features = config["features"]
-    if not features or len(features) != len(set(features)) or (
-        set(features) & {"ts", "node_id", "level", "message", FAILURE, "split"}
-    ):
-        raise ValueError("Features must be unique and exclude labels and identifiers")
-    thresholds = config["thresholds"]
-    if not thresholds or not all(0 < value < 1 for value in thresholds):
-        raise ValueError("Threshold candidates must be strictly between 0 and 1")
-
     with source.open("rb") as stream:
         source_hash = hashlib.file_digest(stream, "sha256").hexdigest()
     parameters = {key: value for key, value in config.items() if key not in {"input", "output"}}
@@ -241,41 +313,53 @@ def run_pipeline(config, source, output):
         LOG.info("Reusing completed artifacts: %s", destination)
         return destination
 
-    raw = load_data(source, features)
-    data = preprocess(raw, config)
+    cutoff = pd.Timestamp(config["as_of"])
+    if cutoff != cutoff.normalize() or cutoff.tz is not None:
+        raise ValueError("The prediction cutoff must be a date without time or time zone")
+    tables, truth, passport = load_data(source, cutoff, set(config["ignored_partitions"]))
+    data = preprocess(tables, truth, passport, config)
+    features = data.columns.drop([KEY, TARGET, "split"]).tolist()
     train, validation, test = (data[data["split"].eq(name)] for name in ("train", "validation", "test"))
-    models = train_model(train, config)
+    models = train_model(train, features, config)
     results = {}
     for name, model in models.items():
         validation_scores = model.predict_proba(validation[features])[:, 1]
-        threshold, cost = select_threshold(validation[FAILURE], validation_scores, config)
-        validation_metrics = evaluate(validation[FAILURE], validation_scores, threshold)
+        threshold = select_threshold(validation[TARGET], validation_scores)
         test_scores = model.predict_proba(test[features])[:, 1]
         results[name] = {
             "threshold": threshold,
-            "validation_cost": cost,
-            "validation": validation_metrics,
+            "validation": evaluate(validation[TARGET], validation_scores, threshold),
             "test": {
-                "default": evaluate(test[FAILURE], test_scores, 0.5),
-                "selected": evaluate(test[FAILURE], test_scores, threshold),
+                "default": evaluate(test[TARGET], test_scores, 0.5),
+                "selected": evaluate(test[TARGET], test_scores, threshold),
             },
         }
-        LOG.info("Evaluated %s: test AP=%.4f, selected threshold=%g",
-                 name, results[name]["test"]["selected"]["average_precision"], threshold)
+        LOG.info("Evaluated %s: test AP=%.4f, F1=%.4f, selected threshold=%.4f",
+                 name, results[name]["test"]["selected"]["average_precision"],
+                 results[name]["test"]["selected"]["f1"], threshold)
 
+    overview = {
+        "as_of": cutoff.date().isoformat(),
+        "before": (cutoff + pd.Timedelta(days=config["horizon_days"])).date().isoformat(),
+        "horizon_days": config["horizon_days"],
+        "splits": {
+            split: {"rows": len(frame), "positive": int(frame[TARGET].sum())}
+            for split, frame in (("train", train), ("validation", validation), ("test", test))
+        },
+        "features": features,
+    }
     output.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix=".staging-", dir=output) as temporary:
         stage = Path(temporary) / "run"
         stage.mkdir()
-        data[["ts", "node_id", "level", *features, FAILURE, "split"]].to_parquet(
-            stage / "prepared.parquet", index=False
-        )
+        data.to_parquet(stage / "prepared.parquet", index=False)
         joblib.dump(models["logistic_regression"], stage / "logistic_regression.joblib")
         models["xgboost"].save_model(stage / "xgboost.json")
         (stage / "metrics.json").write_text(
-            json.dumps(results, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+            json.dumps({"dataset": overview, "models": results}, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
         )
-        write_report(stage / "report.md", data, len(raw), results)
+        write_report(stage / "report.md", data, overview, results)
         try:
             stage.rename(destination)
         except OSError as error:
@@ -287,7 +371,7 @@ def run_pipeline(config, source, output):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run the network telemetry pipeline.")
+    parser = argparse.ArgumentParser(description="Run the subscriber churn prediction pipeline.")
     parser.add_argument("--config", type=Path, default=ROOT / "config.json")
     parser.add_argument("--input", type=Path, help="Override the input archive")
     parser.add_argument("--output", type=Path, help="Override the artifacts directory")
@@ -299,7 +383,7 @@ def main():
         source = args.input or config_dir / config["input"]
         output = args.output or config_dir / config["output"]
         run_pipeline(config, source, output)
-    except (OSError, ValueError, KeyError, tarfile.TarError) as error:
+    except (OSError, ValueError, KeyError, RuntimeError, tarfile.TarError) as error:
         LOG.error("Pipeline failed: %s", error)
         return 1
     return 0

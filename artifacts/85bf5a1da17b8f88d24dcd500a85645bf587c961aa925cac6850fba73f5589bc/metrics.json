@@ -1,0 +1,80 @@
+{
+  "logistic_regression": {
+    "threshold": 0.99,
+    "validation_cost": 0,
+    "validation": {
+      "roc_auc": 1.0,
+      "average_precision": 1.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "tp": 157,
+      "fp": 0,
+      "fn": 0,
+      "tn": 32774
+    },
+    "test": {
+      "default": {
+        "roc_auc": 1.0,
+        "average_precision": 1.0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "tp": 148,
+        "fp": 0,
+        "fn": 0,
+        "tn": 33047
+      },
+      "selected": {
+        "roc_auc": 1.0,
+        "average_precision": 1.0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "tp": 148,
+        "fp": 0,
+        "fn": 0,
+        "tn": 33047
+      }
+    }
+  },
+  "xgboost": {
+    "threshold": 0.2,
+    "validation_cost": 4000,
+    "validation": {
+      "roc_auc": 0.9999986395927485,
+      "average_precision": 0.9996068255091609,
+      "precision": 0.9515151515151515,
+      "recall": 1.0,
+      "f1": 0.9751552795031055,
+      "tp": 157,
+      "fp": 8,
+      "fn": 0,
+      "tn": 32766
+    },
+    "test": {
+      "default": {
+        "roc_auc": 0.9999973420329277,
+        "average_precision": 0.999388020272159,
+        "precision": 0.9932432432432432,
+        "recall": 0.9932432432432432,
+        "f1": 0.9932432432432432,
+        "tp": 147,
+        "fp": 1,
+        "fn": 1,
+        "tn": 33046
+      },
+      "selected": {
+        "roc_auc": 0.9999973420329277,
+        "average_precision": 0.999388020272159,
+        "precision": 0.9866666666666667,
+        "recall": 1.0,
+        "f1": 0.9932885906040269,
+        "tp": 148,
+        "fp": 2,
+        "fn": 0,
+        "tn": 33045
+      }
+    }
+  }
+}

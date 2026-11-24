@@ -1,29 +1,35 @@
-# Архитектура конвейера
+# Архитектура конвейера прогноза оттока
 
 ```mermaid
 flowchart TD
-    Input["Источник · data/telemetry-xs.tar.gz<br/>Суточные JSONL-разделы синтетической телеметрии"]
-    Config["Настройки · config.json<br/>Признаки, seed, разбиение, параметры моделей и порогов"]
-    Load["load_data · чтение JSONL<br/>Проверка разделов и обязательных полей"]
-    Prep["preprocess · подготовка<br/>Дедупликация, признаки и разбиение по узлам"]
-    Train["train_model · обучение на train<br/>StandardScaler + LogisticRegression, XGBoost"]
-    Threshold["select_threshold · выбор порога<br/>Прогнозы моделей на validation"]
-    Eval["evaluate · качество на test<br/>Метрики при 0.5 и выбранном пороге"]
-    Save["Хранилище · artifacts/&lt;ключ запуска&gt;/<br/>prepared.parquet, logistic_regression.joblib, xgboost.json,<br/>metrics.json и report.md"]
+    Source["Данные · data/churn-xs.tar.gz"]
+    Raw["Наблюдения · CDR, обращения, телеметрия"]
+    Truth["Разметка · reference/churn_truth.csv и passport.json"]
+    Config["Настройки · config.json"]
+    Load["load_data · чтение разделов до среза и проверка входа"]
+    Features["preprocess · очистка и агрегация по абоненту"]
+    Label["Метка · уход в окне прогноза"]
+    Split["Разбиение по абонентам · train / validation / test"]
+    Train["train_model · логистическая регрессия и XGBoost"]
+    Threshold["Выбор порога на validation"]
+    Eval["evaluate · расчёт метрик на test"]
+    Output["artifacts/ключ запуска/<br/>prepared.parquet, модели, metrics.json, report.md"]
 
-    Input --> Load --> Prep
-    Config --> Prep
+    Source --> Raw --> Load --> Features
+    Source --> Truth --> Label
+    Config --> Load
+    Config --> Label
     Config --> Train
-    Config --> Threshold
-    Prep -->|train| Train
-    Prep -->|validation| Threshold
-    Prep -->|test| Eval
-    Train --> Threshold
+    Features --> Split
+    Label --> Split
+    Split -->|train| Train
+    Split -->|validation| Threshold
+    Split -->|test| Eval
+    Train --> Threshold --> Eval
     Train --> Eval
-    Threshold --> Eval
-    Prep -->|данные и обзор| Save
-    Train -->|модели| Save
-    Eval -->|метрики| Save
+    Split --> Output
+    Train --> Output
+    Eval --> Output
 ```
 
-JSONL-файлы читаются из архива по порядку дат. Все стадии выполняются одним процессом. Логи идут в стандартный поток ошибок. Конвейер формирует весь комплект во временной папке и публикует его одним переименованием в пределах выходной директории. Каталог с тем же ключом используется повторно.
+В признаках используются события до даты прогноза и CDR, уже полученные к этой дате. Даты ухода используются на стадии разметки. Все стадии выполняются в одном процессе, а комплект результатов публикуется после сохранения всех файлов.
