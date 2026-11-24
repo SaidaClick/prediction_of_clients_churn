@@ -1,0 +1,28 @@
+{
+  "input": "data/telemetry-xs.tar.gz",
+  "output": "artifacts",
+  "seed": 42,
+  "test_folds": 5,
+  "validation_folds": 4,
+  "features": ["load_pct", "active_sessions", "error_rate", "latency_ms", "temperature_c", "hour"],
+  "logistic_regression": {
+    "class_weight": "balanced",
+    "max_iter": 1000
+  },
+  "xgboost": {
+    "n_estimators": 200,
+    "max_depth": 2,
+    "learning_rate": 0.2,
+    "min_child_weight": 1,
+    "subsample": 1.0,
+    "colsample_bytree": 0.8,
+    "gamma": 0.5,
+    "reg_lambda": 10,
+    "scale_pos_weight": 15.2,
+    "eval_metric": "logloss",
+    "n_jobs": 1
+  },
+  "thresholds": [0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.98, 0.99],
+  "false_positive_cost": 500,
+  "false_negative_cost": 5000
+}
